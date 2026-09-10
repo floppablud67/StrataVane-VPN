@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+import tempfile
+import time
+import zipfile
+from datetime import datetime
+
+# Enforce GUI display server settings
+os.environ['QT_QPA_PLATFORM'] = 'xcb'
+os.environ['DISPLAY'] = os.environ.get('DISPLAY', ':0')
+
+try:
+    from PyQt5.QtWidgets import *
+    from PyQt5.QtCore import *
+    from PyQt5.QtGui import *
+    import requests
+    from bs4 import BeautifulSoup
+except ImportError:
+    print("[!] Missing dependencies. Install with: sudo pacman -S python-pyqt5 python-requests python-beautifulsoup4")
+    sys.exit(1)
+
+CONFIG_DIR = os.path.expanduser("~/.vpnbook")
+VPNBOOK_URL = "https://www.vpnbook.com"
+
+class CredentialManager:
+    @staticmethod
+    def fetch_vpnbook_password():
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64)'}
+            res = requests.get(f"{VPNBOOK_URL}/freevpn/openvpn", headers=headers, timeout=8)
+            soup = BeautifulSoup(res.text, 'html.parser')
+            for li in soup.find_all('li'):
+                text = li.get_text()
+                if 'Password:' in text:
+                    p = text.split(':')[-1].strip().split()[0]
+                    if len(p) >= 4:
+                        return p
+        except Exception:
+            pass
+        return "3ssumf2"
+
+class VPNWorker(QThread):
+    status_signal = pyqtSignal(str, bool)
+    log_signal = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        self.process = None
+        self.running = False
+        
+    def start_vpn(self, config_path, username, password):
+        self.config_path = config_path
+        self.username = username
+        self.password = password
+        self.start()
+        
+    def run(self):
+        auth = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
+        auth.write(f"{self.username}\n{self.password}\n")
+        auth.close()
+        os.chmod(auth.name, 0o600)
+        
+        log_path = '/tmp/openvpn_gui_active.log'
+        if os.path.exists(log_path):
+            os.remove(log_path)
+            
+        cmd = [
+            'openvpn',
+            '--config', self.config_path,
+            '--auth-user-pass', auth.name,
+            '--log', log_path,
+            '--redirect-gateway', 'def1'
+        ]
+        
+        self.status_signal.emit("Cleaning existing OpenVPN instances...", False)
+        subprocess.run(['killall', 'openvpn'], stderr=subprocess.DEVNULL)
+        time.sleep(1)
+        
+        self.status_signal.emit("Launching OpenVPN connection daemon...", False)
+        self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        self.running = True
+        start_time = time.time()
+        last_read_pos = 0
+        
+        while self.running and (time.time() - start_time) < 45:
+            if self.process.poll() is not None:
+                break
+                
+            if os.path.exists(log_path):
+                try:
+                    with open(log_path, 'r') as f:
+                        f.seek(last_read_pos)
+                        new_lines = f.readlines()
+                        last_read_pos = f.tell()
+                        
+                        for line in new_lines:
+                            line_str = line.strip()
+                            if line_str:
+                                self.log_signal.emit(line_str)
+                            if 'Initialization Sequence Completed' in line_str:
+                                self.status_signal.emit("Connected! OpenVPN tunnel is active.", True)
+                                return
+                            elif 'AUTH_FAILED' in line_str:
+                                self.status_signal.emit("Authentication failed. Check user/password.", False)
+                                return
+                except Exception:
+                    pass
+            time.sleep(1)
+            
+        self.status_signal.emit("Connection attempt timed out.", False)
+        self.stop()
+
+    def stop(self):
+        self.running = False
+        if self.process:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=2)
+            except Exception:
+                pass
+            self.process = None
+        subprocess.run(['killall', 'openvpn'], stderr=subprocess.DEVNULL)
+
+class OpenVPNGUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.worker = VPNWorker()
+        self.configs = []
+        self.init_ui()
+        self.sync_and_load_files()
+        
+    def init_ui(self):
+        self.setWindowTitle("StrataVane VPN")
+        self.resize(900, 680)
+        
+        self.setStyleSheet("""
+            QMainWindow { background-color: #0d1117; }
+            QLabel { color: #c9d1d9; font-family: sans-serif; font-size: 13px; }
+            QLabel#appHeader {
+                color: #58a6ff;
+                font-family: sans-serif;
+                font-size: 22px;
+                font-weight: bold;
+                padding-bottom: 2px;
+            }
+            QGroupBox {
+                color: #58a6ff;
+                font-weight: bold;
+                border: 1px solid #30363d;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 15px;
+            }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+            QListWidget {
+                background-color: #161b22;
+                color: #f0f6fc;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                font-family: monospace;
+                font-size: 12px;
+            }
+            QListWidget::item { padding: 8px; border-bottom: 1px solid #21262d; }
+            QListWidget::item:selected { background-color: #1f6beb; color: #ffffff; }
+            QLineEdit {
+                background-color: #161b22;
+                color: #f0f6fc;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                padding: 6px;
+            }
+            QPushButton {
+                background-color: #238636;
+                color: #ffffff;
+                border: none;
+                border-radius: 6px;
+                padding: 10px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #2ea043; }
+            QPushButton#btnDisconnect { background-color: #da3633; }
+            QPushButton#btnDisconnect:hover { background-color: #f85149; }
+            QPushButton#btnSecondary { background-color: #21262d; border: 1px solid #30363d; }
+            QPushButton#btnSecondary:hover { background-color: #30363d; }
+            QTextEdit {
+                background-color: #010409;
+                color: #3fb950;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                font-family: monospace;
+                font-size: 11px;
+            }
+        """)
+        
+        main_layout = QVBoxLayout()
+        main_layout.setSpacing(12)
+        main_layout.setContentsMargins(15, 15, 15, 15)
+        
+        # Header Banner
+        lbl_header = QLabel("StrataVane VPN")
+        lbl_header.setObjectName("appHeader")
+        main_layout.addWidget(lbl_header)
+        
+        # Upper Section: Config Selection
+        file_box = QGroupBox("1. Select OpenVPN Profile (.ovpn)")
+        file_layout = QVBoxLayout()
+        
+        self.file_list = QListWidget()
+        file_layout.addWidget(self.file_list)
+        
+        file_btn_layout = QHBoxLayout()
+        self.btn_browse = QPushButton("Browse Custom .ovpn File...")
+        self.btn_browse.setObjectName("btnSecondary")
+        self.btn_browse.clicked.connect(self.browse_custom_file)
+        file_btn_layout.addWidget(self.btn_browse)
+        
+        self.btn_refresh = QPushButton("Fetch / Sync VPNBook Bundles")
+        self.btn_refresh.setObjectName("btnSecondary")
+        self.btn_refresh.clicked.connect(self.sync_and_load_files)
+        file_btn_layout.addWidget(self.btn_refresh)
+        
+        file_layout.addLayout(file_btn_layout)
+        file_box.setLayout(file_layout)
+        main_layout.addWidget(file_box)
+        
+        # Middle Section: Credentials & Controls
+        auth_box = QGroupBox("2. Authentication & Connection")
+        auth_layout = QHBoxLayout()
+        
+        auth_layout.addWidget(QLabel("User:"))
+        self.txt_user = QLineEdit("vpnbook")
+        auth_layout.addWidget(self.txt_user)
+        
+        auth_layout.addWidget(QLabel("Pass:"))
+        self.txt_pass = QLineEdit()
+        auth_layout.addWidget(self.txt_pass)
+        
+        self.btn_connect = QPushButton("CONNECT")
+        self.btn_connect.clicked.connect(self.handle_connect)
+        auth_layout.addWidget(self.btn_connect)
+        
+        self.btn_disconnect = QPushButton("DISCONNECT")
+        self.btn_disconnect.setObjectName("btnDisconnect")
+        self.btn_disconnect.clicked.connect(self.handle_disconnect)
+        auth_layout.addWidget(self.btn_disconnect)
+        
+        auth_box.setLayout(auth_layout)
+        main_layout.addWidget(auth_box)
+        
+        # Lower Section: Live Output Logs
+        self.lbl_status = QLabel("Status: Idle")
+        self.lbl_status.setStyleSheet("color: #d29922; font-weight: bold; font-size: 14px;")
+        main_layout.addWidget(self.lbl_status)
+        
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        main_layout.addWidget(self.log_box)
+        
+        container = QWidget()
+        container.setLayout(main_layout)
+        self.setCentralWidget(container)
+        
+        self.worker.status_signal.connect(self.on_status_update)
+        self.worker.log_signal.connect(self.append_log)
+
+    def sync_and_load_files(self):
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        self.append_log("Syncing config files from VPNBook...")
+        
+        try:
+            res = requests.get(f"{VPNBOOK_URL}/freevpn/openvpn", timeout=8)
+            soup = BeautifulSoup(res.text, 'html.parser')
+            for a in soup.find_all('a', href=True):
+                if a['href'].endswith('.zip'):
+                    link = a['href'] if a['href'].startswith('http') else VPNBOOK_URL + a['href']
+                    r = requests.get(link)
+                    zpath = os.path.join(CONFIG_DIR, 'bundle.zip')
+                    with open(zpath, 'wb') as f:
+                        f.write(r.content)
+                    with zipfile.ZipFile(zpath, 'r') as z:
+                        z.extractall(CONFIG_DIR)
+                    os.remove(zpath)
+        except Exception as e:
+            self.append_log(f"Sync note: {e}")
+            
+        # Fetch dynamic password
+        pwd = CredentialManager.fetch_vpnbook_password()
+        self.txt_pass.setText(pwd)
+        
+        self.reload_file_list()
+
+    def reload_file_list(self):
+        self.configs.clear()
+        self.file_list.clear()
+        
+        for root, _, files in os.walk(CONFIG_DIR):
+            for f in files:
+                if f.endswith('.ovpn'):
+                    full_path = os.path.join(root, f)
+                    self.configs.append({'name': f, 'path': full_path})
+                    
+        self.configs = sorted(self.configs, key=lambda x: x['name'])
+        for item in self.configs:
+            self.file_list.addItem(item['name'])
+            
+        self.append_log(f"Loaded {len(self.configs)} configuration file(s).")
+
+    def browse_custom_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select OpenVPN File", "", "OpenVPN Config (*.ovpn)")
+        if path:
+            filename = os.path.basename(path)
+            self.configs.append({'name': filename, 'path': path})
+            self.file_list.addItem(f"[Custom] {filename}")
+            self.file_list.setCurrentRow(self.file_list.count() - 1)
+
+    def handle_connect(self):
+        item = self.file_list.currentItem()
+        if not item:
+            self.append_log("Error: Select a profile from the list first.")
+            return
+            
+        selected_text = item.text()
+        target_path = None
+        for c in self.configs:
+            if c['name'] in selected_text:
+                target_path = c['path']
+                break
+                
+        if not target_path or not os.path.exists(target_path):
+            self.append_log("Error: Config file path does not exist.")
+            return
+            
+        user = self.txt_user.text().strip()
+        password = self.txt_pass.text().strip()
+        
+        self.btn_connect.setEnabled(False)
+        self.worker.start_vpn(target_path, user, password)
+
+    def handle_disconnect(self):
+        self.worker.stop()
+        self.btn_connect.setEnabled(True)
+        self.lbl_status.setText("Status: Disconnected")
+        self.append_log("OpenVPN tunnel stopped.")
+
+    def on_status_update(self, msg, success):
+        self.lbl_status.setText(f"Status: {msg}")
+        self.append_log(f"[*] {msg}")
+        if success or "timed out" in msg or "failed" in msg.lower():
+            self.btn_connect.setEnabled(True)
+
+    def append_log(self, text):
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        self.log_box.append(f"[{timestamp}] {text}")
+
+def main():
+    if os.geteuid() != 0:
+        print("[!] OpenVPN requires root permissions for interface/routing changes.")
+        print("[!] Run with: sudo python3 openvpn_gui.py")
+        sys.exit(1)
+        
+    app = QApplication(sys.argv)
+    window = OpenVPNGUI()
+    window.show()
+    sys.exit(app.exec_())
+
+if __name__ == '__main__':
+    main()
