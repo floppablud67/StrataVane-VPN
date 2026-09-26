@@ -1,4 +1,3 @@
-Here is the fully formatted Markdown. Every command is separated into its own clean code block so GitHub automatically shows the single-line or block copy buttons for each individual command:
 Installing StrataVane VPN
 
 StrataVane requires admin/root privileges to run (OpenVPN needs to modify network interfaces and routing tables). Pick your OS below.   
@@ -166,4 +165,3 @@ Notes
 
     Requires admin/root because OpenVPN needs to create a tun/utun/TAP interface and rewrite your default route — there's no way around this on any OS.   
     PY
-
