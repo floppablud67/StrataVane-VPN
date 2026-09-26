@@ -5,11 +5,19 @@ import subprocess
 import tempfile
 import time
 import zipfile
+import colorsys
+import random
+import math
+import wave
+import struct
 from datetime import datetime
 
-# Enforce GUI display server settings
-os.environ['QT_QPA_PLATFORM'] = 'xcb'
-os.environ['DISPLAY'] = os.environ.get('DISPLAY', ':0')
+import platform
+if platform.system() == "Linux":
+    # xcb is the X11 display driver; forcing it is fine on Linux but would
+    # crash the app on Windows/macOS, which don't have it. Only set it here.
+    os.environ.setdefault('QT_QPA_PLATFORM', 'xcb')
+    os.environ.setdefault('DISPLAY', os.environ.get('DISPLAY', ':0'))
 
 try:
     from PyQt5.QtWidgets import *
@@ -21,9 +29,1158 @@ except ImportError:
     print("[!] Missing dependencies. Install with: sudo pacman -S python-pyqt5 python-requests python-beautifulsoup4")
     sys.exit(1)
 
+try:
+    from PyQt5.QtMultimedia import QSoundEffect
+    SOUND_AVAILABLE = True
+except ImportError:
+    # Qt Multimedia is a separate system package on most distros. If it's
+    # not installed, themed sound just silently disables itself rather than
+    # crashing the whole app.
+    SOUND_AVAILABLE = False
+
 CONFIG_DIR = os.path.expanduser("~/.vpnbook")
 VPNBOOK_URL = "https://www.vpnbook.com"
 
+
+def kill_openvpn():
+    """Cross-platform replacement for the old hardcoded 'killall openvpn' call,
+    which doesn't exist on Windows and would raise instead of just failing quietly."""
+    try:
+        if platform.system() == "Windows":
+            subprocess.run(['taskkill', '/IM', 'openvpn.exe', '/F'],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.run(['killall', 'openvpn'], stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def is_admin():
+    """Cross-platform replacement for os.geteuid(), which doesn't exist on Windows."""
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except Exception:
+            return False
+    return os.geteuid() == 0
+
+
+# =====================================================================
+#  THEME ENGINE — 100+ static themes, plus a curated set of "Live"
+#  themes that reuse the same colors but render an animated background.
+# =====================================================================
+def _hsv_to_hex(h, s, v):
+    r, g, b = colorsys.hsv_to_rgb((h % 360) / 360, max(0, min(s, 1)), max(0, min(v, 1)))
+    return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
+
+
+def _hex_to_rgb(hexcolor):
+    hexcolor = hexcolor.lstrip('#')
+    return tuple(int(hexcolor[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _rgba(hexcolor, alpha):
+    r, g, b = _hex_to_rgb(hexcolor)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def _gen_color_set(seed):
+    """Deterministic color family from any seed string -- same seed always
+    yields the same colors, used to generate large numbers of distinct
+    themes without hand-listing every hex code."""
+    rng = random.Random(seed)
+    hue = rng.uniform(0, 360)
+    sat = rng.uniform(0.65, 1.0)
+    val = rng.uniform(0.85, 1.0)
+    return {
+        "accent": _hsv_to_hex(hue, sat, val),
+        "accent_hover": _hsv_to_hex(hue, min(sat + 0.08, 1), min(val + 0.05, 1)),
+        "accent2": _hsv_to_hex(hue + rng.choice([30, -30, 150, 180]), sat * 0.85, val),
+        "border": _hsv_to_hex(hue, 0.4, 0.3),
+    }
+
+
+_BASE_THEMES = [
+    ("Cosmic Void", 258, 0.75, 0.95), ("Nebula Drift", 285, 0.70, 0.92),
+    ("Galactic Core", 320, 0.75, 0.95), ("Event Horizon", 210, 0.85, 0.90),
+    ("Stardust", 45, 0.60, 0.95), ("Supernova", 15, 0.85, 0.95),
+    ("Pulsar", 190, 0.90, 0.95), ("Andromeda", 265, 0.80, 0.90),
+    ("Solar Flare", 25, 0.95, 1.00), ("Dark Matter", 250, 0.40, 0.60),
+    ("Cyber Tokyo", 320, 0.95, 1.00), ("Neon Grid", 175, 0.95, 1.00),
+    ("Synthwave", 300, 0.90, 1.00), ("Blade Runner", 195, 0.85, 0.95),
+    ("Matrix Code", 130, 0.90, 0.85), ("Hacker Terminal", 140, 1.00, 0.70),
+    ("Vaporwave", 310, 0.60, 1.00), ("Tron Legacy", 185, 1.00, 1.00),
+    ("Glitch", 335, 0.95, 1.00), ("Circuit Board", 155, 0.80, 0.85),
+    ("Deep Ocean", 200, 0.85, 0.85), ("Coral Reef", 350, 0.70, 0.95),
+    ("Arctic Ice", 195, 0.40, 0.95), ("Emerald City", 150, 0.75, 0.85),
+    ("Amazon Canopy", 115, 0.65, 0.75), ("Sakura Dusk", 335, 0.55, 0.95),
+    ("Autumn Ember", 20, 0.80, 0.90), ("Golden Hour", 40, 0.85, 1.00),
+    ("Lavender Fields", 270, 0.45, 0.90), ("Mint Frost", 165, 0.50, 0.90),
+    ("Blood Moon", 355, 0.85, 0.80), ("Molten Core", 10, 0.95, 1.00),
+    ("Toxic Waste", 90, 0.95, 0.90), ("Radioactive", 75, 1.00, 0.95),
+    ("Obsidian Shard", 220, 0.30, 0.50), ("Amethyst", 275, 0.65, 0.85),
+    ("Rose Gold", 15, 0.35, 0.95), ("Royal Purple", 260, 0.70, 0.75),
+    ("Sapphire", 215, 0.85, 0.90), ("Ruby", 350, 0.90, 0.85),
+    ("Topaz", 40, 0.80, 0.95), ("Onyx", 230, 0.20, 0.40),
+    ("Jade", 145, 0.60, 0.75), ("Citrine", 50, 0.85, 0.95),
+    ("Garnet", 0, 0.85, 0.80), ("Turquoise", 175, 0.70, 0.90),
+    ("Midnight Frost", 205, 0.50, 0.80), ("Aurora Borealis", 160, 0.85, 0.95),
+    ("Northern Lights", 190, 0.90, 0.95), ("Ghost Protocol", 200, 0.15, 0.85),
+    ("Stealth Mode", 0, 0.00, 0.70), ("Carbon Fiber", 210, 0.10, 0.55),
+    ("Gunmetal", 215, 0.15, 0.60), ("Platinum", 220, 0.05, 0.85),
+    ("Volcanic Ash", 20, 0.30, 0.40), ("Wildfire", 12, 0.95, 0.95),
+    ("Peach Sorbet", 25, 0.50, 1.00), ("Cotton Candy", 320, 0.40, 1.00),
+    ("Bubblegum", 330, 0.65, 1.00),
+]
+
+_THEME_VARIANTS = [
+    ("OLED", "#000000", "#0a0a0a", "#0f0f10"),
+    ("Midnight", "#050508", "#0c0c14", "#12121c"),
+]
+
+THEMES = {}
+for _name, _hue, _sat, _val in _BASE_THEMES:
+    _accent = _hsv_to_hex(_hue, _sat, _val)
+    _accent_hover = _hsv_to_hex(_hue, min(_sat + 0.1, 1), min(_val + 0.05, 1))
+    _accent2 = _hsv_to_hex(_hue + 35, _sat * 0.8, _val)
+    _border = _hsv_to_hex(_hue, 0.35, 0.28)
+    for _vname, _bg, _panel, _panel2 in _THEME_VARIANTS:
+        _key = f"{_name} ({_vname})"
+        THEMES[_key] = {
+            "bg": _bg, "panel": _panel, "panel2": _panel2, "border": _border,
+            "accent": _accent, "accent_hover": _accent_hover, "accent2": _accent2,
+            "text": "#f0f0f5", "subtext": "#8b8b96",
+            "success": "#2ecc71", "danger": "#ff4757", "warning": "#ffa726",
+        }
+
+# ---- 300 additional themes, procedurally generated but with real, distinct
+# ---- identities: adjective x noun name pairs, each deterministically
+# ---- seeded so the same name always yields the same striking color combo.
+_EXTRA_ADJECTIVES = [
+    "Quantum", "Astral", "Feral", "Velvet", "Crystal", "Phantom", "Radiant", "Savage",
+    "Electric", "Lunar", "Solar", "Arcane", "Mythic", "Frozen", "Molten", "Neon",
+    "Shadow", "Crimson", "Azure", "Prismatic", "Ethereal", "Glacial", "Chrome",
+    "Titanium", "Celestial", "Rogue", "Venomous", "Phosphor", "Iridescent", "Spectral",
+]
+_EXTRA_NOUNS = [
+    "Pulse", "Drift", "Bloom", "Fracture", "Echo", "Halo", "Surge", "Wraith",
+    "Cascade", "Horizon", "Nova", "Reverie", "Tempest", "Mirage",
+]
+
+for _adj in _EXTRA_ADJECTIVES:
+    for _noun in _EXTRA_NOUNS:
+        _name = f"{_adj} {_noun}"
+        if _name in THEMES:
+            continue
+        _cs = _gen_color_set(_name)
+        THEMES[_name] = {
+            "bg": "#000000", "panel": "#0a0a0a", "panel2": "#0f0f10", "border": _cs["border"],
+            "accent": _cs["accent"], "accent_hover": _cs["accent_hover"], "accent2": _cs["accent2"],
+            "text": "#f0f0f5", "subtext": "#8b8b96",
+            "success": "#2ecc71", "danger": "#ff4757", "warning": "#ffa726",
+        }
+
+DEFAULT_THEME = "Cosmic Void (OLED)"
+THEME_NAMES = sorted(THEMES.keys())
+
+# Tier 2: LIVE themes. 6 real distinct animation engines (ocean, glitch,
+# particles, matrix, aurora, grid) x many evocative color moods = 100+ named
+# themes. Each name really does look/feel different (different hue family),
+# even though a handful of them share the same underlying motion engine.
+LIVE_MODE_LABELS = {
+    "ocean": ("🌊", "Ocean"), "glitch": ("⚡", "Glitch"), "particles": ("✨", "Particle"),
+    "matrix": ("🟩", "Matrix"), "aurora": ("🌈", "Aurora"), "grid": ("🔷", "Grid"),
+}
+_LIVE_MOODS = [
+    "Tempest", "Voyage", "Reverie", "Eclipse", "Zenith", "Oblivion", "Mirage",
+    "Solstice", "Requiem", "Odyssey", "Labyrinth", "Phoenix", "Abyssal",
+    "Elysium", "Nomad", "Infinity", "Wanderlust",
+]
+
+LIVE_THEMES = {}
+for _mode in LIVE_MODE_LABELS:
+    _emoji, _label = LIVE_MODE_LABELS[_mode]
+    for _mood in _LIVE_MOODS:
+        _seed = f"live-{_mode}-{_mood}"
+        _cs = _gen_color_set(_seed)
+        _key = f"Live·{_mood}·{_mode}"
+        THEMES[_key] = {
+            "bg": "#000000", "panel": "#0a0a0a", "panel2": "#0f0f10", "border": _cs["border"],
+            "accent": _cs["accent"], "accent_hover": _cs["accent_hover"], "accent2": _cs["accent2"],
+            "text": "#f0f0f5", "subtext": "#8b8b96",
+            "success": "#2ecc71", "danger": "#ff4757", "warning": "#ffa726",
+        }
+        _display = f"{_emoji} {_mood} {_label} — Live"
+        LIVE_THEMES[_display] = {"base": _key, "mode": _mode}
+
+LIVE_THEME_NAMES = sorted(LIVE_THEMES.keys())
+
+# Tier 3: EXAGGERATED themes. 10 real distinct full-screen set-piece engines
+# (6 original, intensified, + 4 brand new: meteor shower, vortex, tsunami,
+# shatter) x many dramatic moods = 100+ named themes.
+EXAG_MODE_LABELS = {
+    "supernova": "SUPERNOVA", "blackhole": "SINGULARITY", "lightning": "STORM",
+    "fireworks": "CELEBRATION", "galaxy": "GALAXY WARP", "inferno": "INFERNO",
+    "meteor": "METEOR STORM", "vortex": "VORTEX", "tsunami": "TSUNAMI", "shatter": "SHATTER",
+}
+_EXAG_MOODS = [
+    "CRIMSON", "GLACIAL", "VOID", "TOXIC", "ROYAL", "SOLAR", "SPECTRAL",
+    "OBSIDIAN", "PLASMA", "ABYSSAL",
+]
+
+EXAGGERATED_THEMES = {}
+for _emode, _elabel in EXAG_MODE_LABELS.items():
+    for _mood in _EXAG_MOODS:
+        _seed = f"exag-{_emode}-{_mood}"
+        _cs = _gen_color_set(_seed)
+        _key = f"Exag·{_mood}·{_emode}"
+        THEMES[_key] = {
+            "bg": "#000000", "panel": "#0a0a0a", "panel2": "#0f0f10", "border": _cs["border"],
+            "accent": _cs["accent"], "accent_hover": _cs["accent_hover"], "accent2": _cs["accent2"],
+            "text": "#f0f0f5", "subtext": "#8b8b96",
+            "success": "#2ecc71", "danger": "#ff4757", "warning": "#ffa726",
+        }
+        _display = f"🔥 {_mood} {_elabel}"
+        EXAGGERATED_THEMES[_display] = {"base": _key, "mode": _emode}
+
+EXAGGERATED_THEME_NAMES = sorted(EXAGGERATED_THEMES.keys())
+
+
+def build_stylesheet(t, translucent=False):
+    if translucent:
+        panel = _rgba(t['panel'], 0.72)
+        panel2 = _rgba(t['panel2'], 0.68)
+        content_bg = "transparent"
+    else:
+        panel = t['panel']
+        panel2 = t['panel2']
+        content_bg = t['bg']
+
+    return f"""
+    QWidget#contentContainer {{ background-color: {content_bg}; }}
+    QLabel {{ color: {t['text']}; font-family: 'Segoe UI', sans-serif; font-size: 13px; background: transparent; }}
+    QLabel#appHeader {{ color: {t['accent']}; font-size: 24px; font-weight: 800; letter-spacing: 1px; background: transparent; }}
+    QLabel#subHeader {{ color: {t['subtext']}; font-size: 11px; background: transparent; }}
+    QGroupBox {{
+        color: {t['accent']}; font-weight: bold; font-size: 12px;
+        background-color: {panel};
+        border: 1px solid {t['border']}; border-radius: 12px;
+        margin-top: 12px; padding-top: 16px;
+    }}
+    QGroupBox::title {{ subcontrol-origin: margin; left: 14px; padding: 0 6px; }}
+    QListWidget {{
+        background-color: {panel2}; color: {t['text']};
+        border: 1px solid {t['border']}; border-radius: 8px;
+        font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 4px;
+    }}
+    QListWidget::item {{ padding: 9px; border-radius: 6px; }}
+    QListWidget::item:selected {{ background-color: {t['accent']}; color: #000000; }}
+    QListWidget::item:hover {{ background-color: {t['border']}; }}
+    QLineEdit, QComboBox {{
+        background-color: {panel2}; color: {t['text']};
+        border: 1px solid {t['border']}; border-radius: 8px; padding: 7px 10px;
+        selection-background-color: {t['accent']};
+    }}
+    QLineEdit:focus, QComboBox:focus {{ border: 1px solid {t['accent']}; }}
+    QComboBox QAbstractItemView {{
+        background-color: {t['panel2']}; color: {t['text']};
+        selection-background-color: {t['accent']}; selection-color: #000000;
+        border: 1px solid {t['border']}; outline: none;
+    }}
+    QPushButton {{
+        background-color: {t['accent']}; color: #000000; border: none;
+        border-radius: 8px; padding: 11px; font-weight: 700; font-size: 12px;
+    }}
+    QPushButton:hover {{ background-color: {t['accent_hover']}; }}
+    QPushButton:disabled {{ background-color: {t['border']}; color: {t['subtext']}; }}
+    QPushButton#btnDisconnect {{ background-color: {t['danger']}; color: #ffffff; }}
+    QPushButton#btnDisconnect:hover {{ background-color: #ff6b7a; }}
+    QPushButton#btnSecondary {{ background-color: {panel2}; color: {t['text']}; border: 1px solid {t['border']}; }}
+    QPushButton#btnSecondary:hover {{ background-color: {t['border']}; }}
+    QPushButton#btnLink {{ background-color: transparent; color: {t['accent']}; border: 1px solid {t['accent']}; }}
+    QPushButton#btnLink:hover {{ background-color: {t['accent']}; color: #000000; }}
+    QTextEdit {{
+        background-color: {_rgba('#000000', 0.78) if translucent else '#000000'}; color: {t['accent']};
+        border: 1px solid {t['border']}; border-radius: 8px;
+        font-family: 'JetBrains Mono', monospace; font-size: 11px; padding: 6px;
+    }}
+    QScrollBar:vertical {{ background: {panel}; width: 10px; border-radius: 5px; }}
+    QScrollBar::handle:vertical {{ background: {t['border']}; border-radius: 5px; min-height: 20px; }}
+    QScrollBar::handle:vertical:hover {{ background: {t['accent']}; }}
+    """
+
+
+# =====================================================================
+#  SOUND ENGINE — every animation engine gets a short, fully synthesized
+#  ambient loop (pure math, no samples/licensed audio — generated once with
+#  Python's stdlib `wave` module and cached to disk). Honest disclosure:
+#  this is lightweight procedural ambience, not studio sound design.
+# =====================================================================
+SAMPLE_RATE = 22050
+
+# (frequency layers, noise amount, duration seconds, waveform shape, slow LFO rate or 0)
+ENGINE_SOUND_SPEC = {
+    "particles": ([220, 330, 440], 0.02, 3.0, "sine", 0.0),
+    "ocean":     ([70, 105],       0.30, 4.0, "sine", 0.30),
+    "glitch":    ([300],           0.65, 1.4, "square", 0.0),
+    "matrix":    ([620, 930],      0.08, 2.0, "square", 0.0),
+    "aurora":    ([180, 270, 360], 0.06, 4.0, "sine", 0.15),
+    "grid":      ([110, 165],      0.12, 2.5, "square", 0.0),
+    "blackhole": ([38, 57],        0.35, 4.0, "sine", 0.05),
+    "fireworks": ([460],           0.75, 1.1, "noise_decay", 0.0),
+    "galaxy":    ([150, 224],      0.06, 4.5, "sine", 0.10),
+    "inferno":   ([90],            0.55, 3.0, "noise_crackle", 0.0),
+    "supernova": ([160, 320],      0.20, 2.5, "sweep_up", 0.0),
+    "lightning": ([45],            0.85, 1.0, "noise_decay", 0.0),
+    "meteor":    ([380],           0.45, 1.4, "sweep_down", 0.0),
+    "vortex":    ([120, 180],      0.40, 3.5, "sine", 0.5),
+    "tsunami":   ([65, 95],        0.45, 4.0, "sine", 0.22),
+    "shatter":   ([760],           0.70, 0.9, "noise_decay", 0.0),
+}
+
+
+def _synth_engine_wave(freqs, noise_amt, duration, shape, lfo_rate):
+    n = int(SAMPLE_RATE * duration)
+    fade_n = max(1, int(SAMPLE_RATE * 0.08))
+    out = [0.0] * n
+    for i in range(n):
+        t = i / SAMPLE_RATE
+        v = 0.0
+        if shape in ("sine", "square"):
+            for f in freqs:
+                if shape == "sine":
+                    v += math.sin(2 * math.pi * f * t)
+                else:
+                    v += 1.0 if math.sin(2 * math.pi * f * t) >= 0 else -1.0
+            v /= max(1, len(freqs))
+            if lfo_rate:
+                v *= 0.6 + 0.4 * math.sin(2 * math.pi * lfo_rate * t)
+        elif shape == "sweep_up":
+            f = freqs[0] * (1 + 2.2 * (i / n))
+            v = math.sin(2 * math.pi * f * t)
+        elif shape == "sweep_down":
+            f = freqs[0] * (1.6 - 1.1 * (i / n))
+            v = math.sin(2 * math.pi * max(f, 30) * t)
+        elif shape == "noise_decay":
+            env = max(0.0, 1.0 - (i / n)) ** 2
+            v = random.uniform(-1, 1) * env
+        elif shape == "noise_crackle":
+            v = random.uniform(-1, 1) if random.random() < 0.15 else 0.0
+            v += 0.3 * math.sin(2 * math.pi * freqs[0] * t)
+        if noise_amt:
+            v = v * (1 - noise_amt) + random.uniform(-1, 1) * noise_amt
+        if i < fade_n:
+            v *= i / fade_n
+        if i > n - fade_n:
+            v *= (n - i) / fade_n
+        out[i] = v
+    peak = max(1e-6, max(abs(x) for x in out))
+    if peak > 0.9:
+        out = [x / peak * 0.9 for x in out]
+    return out
+
+
+def _write_wav(path, samples):
+    with wave.open(path, 'w') as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(SAMPLE_RATE)
+        frames = b''.join(struct.pack('<h', max(-32767, min(32767, int(s * 32767)))) for s in samples)
+        f.writeframes(frames)
+
+
+class SoundEngine:
+    """Generates and plays one ambient loop per animation engine. Fully
+    self-contained (synthesizes its own audio, no external files/downloads),
+    fails silently and disables itself if Qt Multimedia isn't installed."""
+
+    def __init__(self):
+        self.available = SOUND_AVAILABLE
+        self.muted = False
+        self._effects = {}
+        self._current = None
+        self.sound_dir = os.path.join(CONFIG_DIR, "sounds")
+        if self.available:
+            try:
+                os.makedirs(self.sound_dir, exist_ok=True)
+            except Exception:
+                self.available = False
+
+    def _ensure_generated(self, mode):
+        path = os.path.join(self.sound_dir, f"{mode}.wav")
+        if os.path.exists(path):
+            return path
+        spec = ENGINE_SOUND_SPEC.get(mode)
+        if not spec:
+            return None
+        try:
+            samples = _synth_engine_wave(*spec)
+            _write_wav(path, samples)
+            return path
+        except Exception:
+            return None
+
+    def _get_effect(self, mode):
+        if mode in self._effects:
+            return self._effects[mode]
+        path = self._ensure_generated(mode)
+        if not path:
+            return None
+        try:
+            eff = QSoundEffect()
+            eff.setSource(QUrl.fromLocalFile(path))
+            eff.setVolume(0.28)
+            eff.setLoopCount(QSoundEffect.Infinite)
+            self._effects[mode] = eff
+            return eff
+        except Exception:
+            return None
+
+    def play_for_mode(self, mode):
+        if not self.available:
+            return
+        self.stop()
+        if self.muted or mode == "none":
+            return
+        eff = self._get_effect(mode)
+        if eff:
+            eff.play()
+            self._current = eff
+
+    def stop(self):
+        if self._current:
+            try:
+                self._current.stop()
+            except Exception:
+                pass
+            self._current = None
+
+    def toggle_mute(self):
+        self.muted = not self.muted
+        if self.muted:
+            self.stop()
+        return self.muted
+
+
+# =====================================================================
+#  ANIMATED BACKGROUND — a full-window canvas painted at ~30fps.
+#  Sits BEHIND the actual UI (which becomes translucent in Live mode).
+# =====================================================================
+class AnimatedBackground(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.mode = "none"          # none | particles | ocean | glitch | matrix | aurora | grid
+        self.color1 = QColor("#58a6ff")
+        self.color2 = QColor("#79c0ff")
+        self.bg_color = QColor("#000000")
+        self._t = 0.0
+        self._particles = []
+        self._matrix_cols = []
+        self._glitch_bands = []
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(33)  # ~30fps
+
+    def set_theme(self, mode, color1, color2, bg_color):
+        self.mode = mode
+        self.color1 = QColor(color1)
+        self.color2 = QColor(color2)
+        self.bg_color = QColor(bg_color)
+        self._init_mode_state()
+        self.update()
+
+    def _init_mode_state(self):
+        w = max(self.width(), 800)
+        h = max(self.height(), 600)
+        if self.mode == "particles":
+            self._particles = [{
+                "x": random.uniform(0, w), "y": random.uniform(0, h),
+                "vx": random.uniform(-0.3, 0.3), "vy": random.uniform(-0.25, 0.25),
+                "r": random.uniform(1.2, 3.2), "phase": random.uniform(0, 6.28),
+            } for _ in range(70)]
+        elif self.mode == "ocean":
+            self._particles = [{
+                "x": random.uniform(0, w), "y": random.uniform(h * 0.4, h),
+                "vy": random.uniform(0.15, 0.5), "r": random.uniform(1.5, 4.0),
+                "phase": random.uniform(0, 6.28),
+            } for _ in range(35)]
+        elif self.mode == "matrix":
+            cols = max(1, w // 18)
+            self._matrix_cols = [{
+                "y": random.uniform(-h, 0), "speed": random.uniform(2.5, 6.5),
+                "len": random.randint(6, 16),
+            } for _ in range(cols)]
+        elif self.mode == "glitch":
+            self._glitch_bands = []
+        elif self.mode == "blackhole":
+            cx, cy = w / 2, h / 2
+            self._particles = [{
+                "angle": random.uniform(0, 6.28), "radius": random.uniform(40, max(w, h) * 0.6),
+                "speed": random.uniform(0.6, 1.6), "r": random.uniform(1.0, 3.0),
+            } for _ in range(220)]
+        elif self.mode == "fireworks":
+            self._particles = []  # bursts spawn dynamically in _tick
+        elif self.mode == "galaxy":
+            cx, cy = w / 2, h / 2
+            self._particles = [{
+                "angle": random.uniform(0, 6.28), "radius": random.uniform(10, max(w, h) * 0.55),
+                "arm": random.choice([0, 2.09, 4.19]), "r": random.uniform(1.0, 2.8),
+            } for _ in range(320)]
+        elif self.mode == "inferno":
+            self._particles = [{
+                "x": random.uniform(0, w), "y": random.uniform(h * 0.6, h + 40),
+                "vy": random.uniform(0.8, 2.2), "sway": random.uniform(0, 6.28),
+                "r": random.uniform(2.0, 6.0),
+            } for _ in range(140)]
+        elif self.mode == "supernova":
+            self._particles = [{
+                "angle": random.uniform(0, 6.28), "speed": random.uniform(0.6, 2.4),
+                "dist": random.uniform(0, 50), "r": random.uniform(1.2, 3.0),
+            } for _ in range(240)]
+        elif self.mode == "lightning":
+            self._particles = []  # bolts spawn dynamically
+        elif self.mode == "meteor":
+            self._particles = [{
+                "x": random.uniform(0, w), "y": random.uniform(-h, 0),
+                "speed": random.uniform(6, 14), "trail": [],
+            } for _ in range(14)]
+        elif self.mode == "vortex":
+            cx = w / 2
+            self._particles = [{
+                "angle": random.uniform(0, 6.28), "radius": random.uniform(20, w * 0.45),
+                "y": random.uniform(0, h), "r": random.uniform(1.5, 3.5),
+            } for _ in range(150)]
+            self._funnel_x = cx
+        elif self.mode == "tsunami":
+            self._particles = [{
+                "x": random.uniform(0, w), "y": h, "vy": random.uniform(0.5, 1.5),
+                "r": random.uniform(1.5, 4.0),
+            } for _ in range(60)]
+        elif self.mode == "shatter":
+            self._particles = []
+            self._shatter_flash = 0.0
+
+    def resizeEvent(self, event):
+        self._init_mode_state()
+        super().resizeEvent(event)
+
+    def _tick(self):
+        self._t += 0.033
+        if self.mode == "particles":
+            w, h = self.width(), self.height()
+            for p in self._particles:
+                p["x"] += p["vx"]
+                p["y"] += p["vy"]
+                if p["x"] < 0: p["x"] = w
+                if p["x"] > w: p["x"] = 0
+                if p["y"] < 0: p["y"] = h
+                if p["y"] > h: p["y"] = 0
+        elif self.mode == "ocean":
+            h = self.height()
+            for p in self._particles:
+                p["y"] -= p["vy"]
+                if p["y"] < h * 0.35:
+                    p["y"] = self.height()
+                    p["x"] = random.uniform(0, self.width())
+        elif self.mode == "matrix":
+            h = self.height()
+            for c in self._matrix_cols:
+                c["y"] += c["speed"]
+                if c["y"] - c["len"] * 18 > h:
+                    c["y"] = random.uniform(-200, 0)
+                    c["speed"] = random.uniform(2.5, 6.5)
+        elif self.mode == "glitch":
+            if random.random() < 0.12:
+                w = self.width()
+                self._glitch_bands = [{
+                    "y": random.uniform(0, self.height()),
+                    "h": random.uniform(3, 18),
+                    "dx": random.uniform(-30, 30),
+                } for _ in range(random.randint(1, 4))]
+            else:
+                self._glitch_bands = []
+
+        elif self.mode == "blackhole":
+            for pt in self._particles:
+                pull = 60.0 / max(pt["radius"], 10.0)
+                pt["radius"] -= pull * pt["speed"]
+                pt["angle"] += 0.03 + pull * 0.01
+                if pt["radius"] < 6:
+                    pt["radius"] = max(self.width(), self.height()) * 0.6
+                    pt["angle"] = random.uniform(0, 6.28)
+
+        elif self.mode == "fireworks":
+            if random.random() < 0.08:
+                cx = random.uniform(self.width() * 0.15, self.width() * 0.85)
+                cy = random.uniform(self.height() * 0.15, self.height() * 0.55)
+                burst_color = self.color1 if random.random() < 0.5 else self.color2
+                for _ in range(55):
+                    ang = random.uniform(0, 6.28)
+                    spd = random.uniform(1.0, 4.5)
+                    self._particles.append({
+                        "x": cx, "y": cy, "vx": math.cos(ang) * spd, "vy": math.sin(ang) * spd,
+                        "life": 1.0, "color": burst_color,
+                    })
+            for pt in self._particles:
+                pt["x"] += pt["vx"]
+                pt["y"] += pt["vy"]
+                pt["vy"] += 0.05  # gravity
+                pt["life"] -= 0.018
+            self._particles = [p for p in self._particles if p["life"] > 0]
+
+        elif self.mode == "galaxy":
+            for pt in self._particles:
+                pt["angle"] += 0.012 * (60.0 / max(pt["radius"], 20.0))
+
+        elif self.mode == "inferno":
+            h = self.height()
+            for pt in self._particles:
+                pt["y"] -= pt["vy"]
+                pt["sway"] += 0.08
+                if pt["y"] < -20:
+                    pt["y"] = self.height() + random.uniform(0, 40)
+                    pt["x"] = random.uniform(0, self.width())
+
+        elif self.mode == "supernova":
+            maxdist = max(self.width(), self.height()) * 0.7
+            for pt in self._particles:
+                pt["dist"] += pt["speed"]
+                if pt["dist"] > maxdist:
+                    pt["dist"] = 0
+                    pt["angle"] = random.uniform(0, 6.28)
+
+        elif self.mode == "lightning":
+            if random.random() < 0.06:
+                x0 = random.uniform(self.width() * 0.1, self.width() * 0.9)
+                pts = [(x0, 0)]
+                x, y = x0, 0
+                while y < self.height():
+                    x += random.uniform(-40, 40)
+                    y += random.uniform(30, 70)
+                    pts.append((x, y))
+                self._particles = [{"bolt": pts, "life": 1.0}]
+            else:
+                for p in self._particles:
+                    p["life"] -= 0.15
+                self._particles = [p for p in self._particles if p["life"] > 0]
+
+        elif self.mode == "meteor":
+            h, w = self.height(), self.width()
+            for m in self._particles:
+                m["x"] += m["speed"] * 0.6
+                m["y"] += m["speed"]
+                m["trail"].append((m["x"], m["y"]))
+                if len(m["trail"]) > 14:
+                    m["trail"].pop(0)
+                if m["y"] > h + 20 or m["x"] > w + 20:
+                    m["x"] = random.uniform(-100, w * 0.6)
+                    m["y"] = random.uniform(-h * 0.4, 0)
+                    m["speed"] = random.uniform(6, 14)
+                    m["trail"] = []
+
+        elif self.mode == "vortex":
+            w, h = self.width(), self.height()
+            self._funnel_x = w / 2 + math.sin(self._t * 0.4) * w * 0.2
+            for pt in self._particles:
+                pull = 50.0 / max(pt["radius"], 8.0)
+                pt["radius"] -= pull * 0.7
+                pt["angle"] += 0.05 + pull * 0.02
+                pt["y"] -= 1.2
+                if pt["radius"] < 4 or pt["y"] < -20:
+                    pt["radius"] = w * 0.45
+                    pt["angle"] = random.uniform(0, 6.28)
+                    pt["y"] = h + random.uniform(0, 40)
+
+        elif self.mode == "tsunami":
+            h = self.height()
+            self._wave_phase = self._t * 1.4
+            for pt in self._particles:
+                pt["y"] -= pt["vy"] * 2
+                if pt["y"] < h * 0.15:
+                    pt["y"] = h
+                    pt["x"] = random.uniform(0, self.width())
+
+        elif self.mode == "shatter":
+            if random.random() < 0.02 or getattr(self, "_shatter_flash", 0.0) > 0.9:
+                self._shatter_flash = 1.0
+                w, h = self.width(), self.height()
+                cx, cy = w / 2, h / 2
+                self._particles = [{
+                    "x": cx, "y": cy,
+                    "vx": math.cos(a) * random.uniform(2, 7), "vy": math.sin(a) * random.uniform(2, 7),
+                    "life": 1.0,
+                } for a in [random.uniform(0, 6.28) for _ in range(50)]]
+            self._shatter_flash = max(0.0, getattr(self, "_shatter_flash", 0.0) - 0.03)
+            for pt in self._particles:
+                pt["x"] += pt["vx"]
+                pt["y"] += pt["vy"]
+                pt["life"] -= 0.012
+            self._particles = [p for p in self._particles if p["life"] > 0]
+
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        p.fillRect(self.rect(), self.bg_color)
+
+        if self.mode == "particles":
+            for pt in self._particles:
+                alpha = 0.25 + 0.55 * (0.5 + 0.5 * math.sin(self._t * 1.3 + pt["phase"]))
+                c = QColor(self.color1)
+                c.setAlphaF(alpha * 0.9)
+                p.setPen(Qt.NoPen)
+                p.setBrush(c)
+                p.drawEllipse(QPointF(pt["x"], pt["y"]), pt["r"] * 2.2, pt["r"] * 2.2)
+                c2 = QColor(self.color1)
+                c2.setAlphaF(min(1.0, alpha))
+                p.setBrush(c2)
+                p.drawEllipse(QPointF(pt["x"], pt["y"]), pt["r"], pt["r"])
+
+        elif self.mode == "ocean":
+            for i, (speed, amp, yoff, col) in enumerate([
+                (0.6, 26, 0.55, self.color1), (0.9, 18, 0.68, self.color2), (1.3, 12, 0.82, self.color1)
+            ]):
+                path = QPainterPath()
+                path.moveTo(0, h)
+                base_y = h * yoff
+                step = 12
+                x = 0
+                path.lineTo(0, base_y)
+                while x <= w:
+                    y = base_y + amp * math.sin(x * 0.02 + self._t * speed * 2)
+                    path.lineTo(x, y)
+                    x += step
+                path.lineTo(w, h)
+                path.closeSubpath()
+                c = QColor(col)
+                c.setAlphaF(0.20 + 0.08 * i)
+                p.setPen(Qt.NoPen)
+                p.setBrush(c)
+                p.drawPath(path)
+            for pt in self._particles:
+                c = QColor(self.color2)
+                c.setAlphaF(0.35 + 0.25 * math.sin(self._t * 2 + pt["phase"]))
+                p.setPen(Qt.NoPen)
+                p.setBrush(c)
+                p.drawEllipse(QPointF(pt["x"], pt["y"]), pt["r"], pt["r"])
+
+        elif self.mode == "matrix":
+            p.setPen(Qt.NoPen)
+            for i, c in enumerate(self._matrix_cols):
+                x = i * 18 + 4
+                for j in range(c["len"]):
+                    yy = c["y"] - j * 18
+                    if 0 <= yy <= h:
+                        alpha = max(0.0, 1.0 - j / c["len"])
+                        col = QColor(self.color1)
+                        col.setAlphaF(alpha * 0.9 if j > 0 else 1.0)
+                        p.setBrush(col)
+                        p.drawRect(QRectF(x, yy, 3, 10))
+
+        elif self.mode == "glitch":
+            for band in self._glitch_bands:
+                y, bh, dx = band["y"], band["h"], band["dx"]
+                c1 = QColor(self.color1); c1.setAlphaF(0.35)
+                c2 = QColor(self.color2); c2.setAlphaF(0.30)
+                p.setPen(Qt.NoPen)
+                p.setBrush(c1)
+                p.drawRect(QRectF(dx, y, w, bh))
+                p.setBrush(c2)
+                p.drawRect(QRectF(-dx, y + bh * 0.4, w, bh * 0.6))
+            if random.random() < 0.04:
+                flash = QColor(self.color1)
+                flash.setAlphaF(0.08)
+                p.fillRect(self.rect(), flash)
+
+        elif self.mode == "aurora":
+            for i, (speed, amp, yoff, col) in enumerate([
+                (0.35, h * 0.12, 0.25, self.color1),
+                (0.5, h * 0.10, 0.40, self.color2),
+                (0.25, h * 0.14, 0.55, self.color1),
+            ]):
+                path = QPainterPath()
+                path.moveTo(0, 0)
+                x = 0
+                pts = []
+                while x <= w:
+                    y = h * yoff + amp * math.sin(x * 0.01 + self._t * speed * 2 + i)
+                    pts.append((x, y))
+                    x += 16
+                path.moveTo(0, 0)
+                path.lineTo(pts[0][0], pts[0][1])
+                for (px, py) in pts:
+                    path.lineTo(px, py)
+                path.lineTo(w, 0)
+                path.closeSubpath()
+                c = QColor(col)
+                c.setAlphaF(0.10 + 0.05 * i)
+                p.setPen(Qt.NoPen)
+                p.setBrush(c)
+                p.drawPath(path)
+
+        elif self.mode == "grid":
+            horizon = h * 0.55
+            c = QColor(self.color1)
+            c.setAlphaF(0.5)
+            pen = QPen(c)
+            pen.setWidthF(1.2)
+            p.setPen(pen)
+            spacing = 46
+            offset = (self._t * 40) % spacing
+            n_lines = int(h / spacing) + 2
+            for i in range(n_lines):
+                y = horizon + (i * spacing - offset)
+                if y < horizon or y > h:
+                    continue
+                fade = 1.0 - (y - horizon) / (h - horizon + 1)
+                cc = QColor(self.color1)
+                cc.setAlphaF(max(0.0, min(0.6, fade)))
+                p.setPen(QPen(cc, 1.2))
+                p.drawLine(QLineF(0, y, w, y))
+            cx = w / 2
+            for vx_top in range(-8, 9):
+                cc = QColor(self.color2)
+                cc.setAlphaF(0.35)
+                p.setPen(QPen(cc, 1.0))
+                p.drawLine(QLineF(cx, horizon, cx + vx_top * 90, h))
+            glow = QRadialGradient(cx, horizon, w * 0.35)
+            gc = QColor(self.color2)
+            gc.setAlphaF(0.25)
+            glow.setColorAt(0.0, gc)
+            glow.setColorAt(1.0, QColor(0, 0, 0, 0))
+            p.setPen(Qt.NoPen)
+            p.setBrush(glow)
+            p.drawEllipse(QPointF(cx, horizon), w * 0.35, w * 0.15)
+
+        elif self.mode == "blackhole":
+            cx, cy = w / 2, h / 2
+            core = QRadialGradient(cx, cy, 70)
+            core.setColorAt(0.0, QColor(0, 0, 0, 255))
+            edge = QColor(self.color1); edge.setAlphaF(0.8)
+            core.setColorAt(0.7, edge)
+            core.setColorAt(1.0, QColor(0, 0, 0, 0))
+            p.setPen(Qt.NoPen)
+            p.setBrush(core)
+            p.drawEllipse(QPointF(cx, cy), 90, 90)
+            for pt in self._particles:
+                x = cx + math.cos(pt["angle"]) * pt["radius"]
+                y = cy + math.sin(pt["angle"]) * pt["radius"] * 0.6
+                fade = min(1.0, pt["radius"] / 200.0)
+                c = QColor(self.color2 if pt["radius"] % 40 < 20 else self.color1)
+                c.setAlphaF(0.85 * fade)
+                p.setBrush(c)
+                p.drawEllipse(QPointF(x, y), pt["r"], pt["r"])
+            p.setBrush(QColor(0, 0, 0, 255))
+            p.drawEllipse(QPointF(cx, cy), 26, 26)
+
+        elif self.mode == "fireworks":
+            for pt in self._particles:
+                c = QColor(pt["color"])
+                c.setAlphaF(max(0.0, pt["life"]))
+                p.setPen(Qt.NoPen)
+                p.setBrush(c)
+                p.drawEllipse(QPointF(pt["x"], pt["y"]), 2.4, 2.4)
+
+        elif self.mode == "galaxy":
+            cx, cy = w / 2, h / 2
+            core = QRadialGradient(cx, cy, 60)
+            cc = QColor(self.color1); cc.setAlphaF(0.9)
+            core.setColorAt(0.0, cc)
+            core.setColorAt(1.0, QColor(0, 0, 0, 0))
+            p.setPen(Qt.NoPen)
+            p.setBrush(core)
+            p.drawEllipse(QPointF(cx, cy), 60, 60)
+            for pt in self._particles:
+                ang = pt["angle"] + pt["arm"]
+                x = cx + math.cos(ang) * pt["radius"]
+                y = cy + math.sin(ang) * pt["radius"] * 0.55
+                fade = 1.0 - min(1.0, pt["radius"] / (max(w, h) * 0.55))
+                c = QColor(self.color1 if int(pt["radius"]) % 2 == 0 else self.color2)
+                c.setAlphaF(0.25 + 0.5 * fade)
+                p.setBrush(c)
+                p.drawEllipse(QPointF(x, y), pt["r"], pt["r"])
+
+        elif self.mode == "inferno":
+            grad = QLinearGradient(0, h, 0, h * 0.4)
+            gc1 = QColor(self.color1); gc1.setAlphaF(0.35)
+            gc2 = QColor(self.color2); gc2.setAlphaF(0.0)
+            grad.setColorAt(0.0, gc1)
+            grad.setColorAt(1.0, gc2)
+            p.fillRect(QRectF(0, h * 0.4, w, h * 0.6), grad)
+            for pt in self._particles:
+                x = pt["x"] + math.sin(pt["sway"]) * 8
+                c = QColor(self.color1 if pt["y"] > h * 0.7 else self.color2)
+                c.setAlphaF(0.7 * max(0.0, min(1.0, (h - pt["y"]) / h + 0.3)))
+                p.setPen(Qt.NoPen)
+                p.setBrush(c)
+                p.drawEllipse(QPointF(x, pt["y"]), pt["r"], pt["r"] * 1.4)
+
+        elif self.mode == "supernova":
+            cx, cy = w / 2, h / 2
+            burst = QRadialGradient(cx, cy, 140)
+            bc = QColor(self.color1); bc.setAlphaF(0.35 + 0.15 * math.sin(self._t * 3))
+            burst.setColorAt(0.0, bc)
+            burst.setColorAt(1.0, QColor(0, 0, 0, 0))
+            p.setPen(Qt.NoPen)
+            p.setBrush(burst)
+            p.drawEllipse(QPointF(cx, cy), 160, 160)
+            for pt in self._particles:
+                x = cx + math.cos(pt["angle"]) * pt["dist"]
+                y = cy + math.sin(pt["angle"]) * pt["dist"]
+                fade = 1.0 - min(1.0, pt["dist"] / (max(w, h) * 0.7))
+                c = QColor(self.color2)
+                c.setAlphaF(max(0.0, fade))
+                p.setBrush(c)
+                p.drawEllipse(QPointF(x, y), pt["r"], pt["r"])
+
+        elif self.mode == "lightning":
+            for flash in self._particles:
+                bolt = flash["bolt"]
+                alpha = max(0.0, flash["life"])
+                glow_c = QColor(self.color1); glow_c.setAlphaF(alpha * 0.06)
+                p.fillRect(self.rect(), glow_c)
+                pen = QPen(QColor(255, 255, 255, int(255 * alpha)))
+                pen.setWidthF(2.2)
+                p.setPen(pen)
+                for i in range(len(bolt) - 1):
+                    p.drawLine(QPointF(*bolt[i]), QPointF(*bolt[i + 1]))
+                pen2 = QPen(QColor(self.color1)); pen2.setWidthF(5)
+                c2 = QColor(self.color1); c2.setAlphaF(alpha * 0.4)
+                pen2.setColor(c2)
+                p.setPen(pen2)
+                for i in range(len(bolt) - 1):
+                    p.drawLine(QPointF(*bolt[i]), QPointF(*bolt[i + 1]))
+
+        elif self.mode == "meteor":
+            p.setPen(Qt.NoPen)
+            for m in self._particles:
+                trail = m["trail"]
+                for i, (tx, ty) in enumerate(trail):
+                    fade = i / max(1, len(trail))
+                    c = QColor(self.color1 if i % 2 == 0 else self.color2)
+                    c.setAlphaF(0.5 * fade)
+                    p.setBrush(c)
+                    p.drawEllipse(QPointF(tx, ty), 2.2 * fade + 0.6, 2.2 * fade + 0.6)
+                head = QColor(255, 255, 255, 230)
+                p.setBrush(head)
+                p.drawEllipse(QPointF(m["x"], m["y"]), 2.6, 2.6)
+
+        elif self.mode == "vortex":
+            fx = getattr(self, "_funnel_x", w / 2)
+            for pt in self._particles:
+                x = fx + math.cos(pt["angle"]) * pt["radius"]
+                y = pt["y"]
+                fade = min(1.0, 1.0 - pt["radius"] / (w * 0.45))
+                c = QColor(self.color1 if pt["r"] > 2.5 else self.color2)
+                c.setAlphaF(0.25 + 0.55 * fade)
+                p.setPen(Qt.NoPen)
+                p.setBrush(c)
+                p.drawEllipse(QPointF(x, y), pt["r"], pt["r"] * 2.2)
+
+        elif self.mode == "tsunami":
+            phase = getattr(self, "_wave_phase", self._t)
+            crest_y = h * (0.35 + 0.08 * math.sin(phase * 0.7))
+            path = QPainterPath()
+            path.moveTo(0, h)
+            path.lineTo(0, crest_y)
+            x = 0
+            while x <= w:
+                y = crest_y + 30 * math.sin(x * 0.015 + phase * 2) + 12 * math.sin(x * 0.04 + phase * 3)
+                path.lineTo(x, y)
+                x += 10
+            path.lineTo(w, h)
+            path.closeSubpath()
+            grad = QLinearGradient(0, crest_y, 0, h)
+            c1 = QColor(self.color1); c1.setAlphaF(0.55)
+            c2 = QColor(self.color2); c2.setAlphaF(0.25)
+            grad.setColorAt(0.0, c1)
+            grad.setColorAt(1.0, c2)
+            p.setPen(Qt.NoPen)
+            p.setBrush(grad)
+            p.drawPath(path)
+            for pt in self._particles:
+                fc = QColor(255, 255, 255, 160)
+                p.setBrush(fc)
+                p.drawEllipse(QPointF(pt["x"], pt["y"]), pt["r"], pt["r"])
+
+        elif self.mode == "shatter":
+            flash = getattr(self, "_shatter_flash", 0.0)
+            if flash > 0:
+                fc = QColor(255, 255, 255, int(120 * flash))
+                p.fillRect(self.rect(), fc)
+            cx, cy = w / 2, h / 2
+            pen = QPen(QColor(self.color1))
+            pen.setWidthF(1.4)
+            c = QColor(self.color1); c.setAlphaF(0.5 + 0.5 * flash)
+            pen.setColor(c)
+            p.setPen(pen)
+            for a in range(0, 360, 15):
+                rad = math.radians(a)
+                p.drawLine(QPointF(cx, cy), QPointF(cx + math.cos(rad) * w * 0.6, cy + math.sin(rad) * h * 0.6))
+            p.setPen(Qt.NoPen)
+            for pt in self._particles:
+                sc = QColor(self.color2)
+                sc.setAlphaF(max(0.0, pt["life"]))
+                p.setBrush(sc)
+                p.drawEllipse(QPointF(pt["x"], pt["y"]), 3, 3)
+
+
+# =====================================================================
+#  SMALL DECORATIVE WIDGETS
+# =====================================================================
+class PulseDot(QWidget):
+    def __init__(self, color="#8b8b96", parent=None):
+        super().__init__(parent)
+        self.setFixedSize(14, 14)
+        self._color = QColor(color)
+        self._opacity = 1.0
+        self._anim = QPropertyAnimation(self, b"opacity")
+        self._anim.setDuration(1400)
+        self._anim.setStartValue(1.0)
+        self._anim.setKeyValueAt(0.5, 0.35)
+        self._anim.setEndValue(1.0)
+        self._anim.setLoopCount(-1)
+        self._anim.setEasingCurve(QEasingCurve.InOutSine)
+
+    def set_color(self, color, pulsing=True):
+        self._color = QColor(color)
+        if pulsing:
+            if self._anim.state() != QPropertyAnimation.Running:
+                self._anim.start()
+        else:
+            self._anim.stop()
+            self._opacity = 1.0
+        self.update()
+
+    def get_opacity(self): return self._opacity
+    def set_opacity(self, v):
+        self._opacity = v
+        self.update()
+    opacity = pyqtProperty(float, get_opacity, set_opacity)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        c = QColor(self._color); c.setAlphaF(self._opacity)
+        glow = QColor(self._color); glow.setAlphaF(self._opacity * 0.35)
+        p.setPen(Qt.NoPen)
+        p.setBrush(glow); p.drawEllipse(0, 0, 14, 14)
+        p.setBrush(c); p.drawEllipse(3, 3, 8, 8)
+
+
+class GlowBar(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(3)
+        self._offset = 0.0
+        self._c1 = QColor("#58a6ff")
+        self._c2 = QColor("#58a6ff")
+        self._anim = QPropertyAnimation(self, b"offset")
+        self._anim.setDuration(3000)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.setLoopCount(-1)
+        self._anim.setEasingCurve(QEasingCurve.Linear)
+        self._anim.start()
+
+    def set_colors(self, c1, c2):
+        self._c1, self._c2 = QColor(c1), QColor(c2)
+        self.update()
+
+    def get_offset(self): return self._offset
+    def set_offset(self, v):
+        self._offset = v
+        self.update()
+    offset = pyqtProperty(float, get_offset, set_offset)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        w = self.width()
+        grad = QLinearGradient(0, 0, w, 0)
+        pos = self._offset
+        grad.setColorAt(max(0.0, pos - 0.25), QColor(0, 0, 0, 0))
+        grad.setColorAt(pos, self._c1)
+        grad.setColorAt(min(1.0, pos + 0.15), self._c2)
+        grad.setColorAt(min(1.0, pos + 0.4), QColor(0, 0, 0, 0))
+        p.fillRect(self.rect(), grad)
+
+
+class LivelyButton(QPushButton):
+    """
+    Bouncy button. Earlier versions either animated the widget's real
+    geometry (which Qt's layout system overrides, so nothing visibly moved)
+    or combined a QGraphicsDropShadowEffect with a custom paintEvent on the
+    SAME widget — those two fight over who's allowed to paint the widget,
+    which is what made it flicker out instead of animating.
+
+    Fix: no graphics effect on this widget at all. Just a scale factor
+    applied purely at paint time via a QPainter transform. The widget's
+    real size never changes (layout has nothing to fight) and there's no
+    competing effect pipeline, so it reliably renders every frame.
+    """
+
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self._scale = 1.0
+        self._scale_anim = QPropertyAnimation(self, b"btnScale")
+
+    def set_glow_color(self, color):
+        # Kept so existing call sites (theme-apply loops) don't need changes.
+        # Glow is now expressed via the QSS :hover background-color instead
+        # of an animated shadow effect, to avoid the paint conflict above.
+        pass
+
+    def get_scale(self): return self._scale
+    def set_scale(self, v):
+        self._scale = v
+        self.update()
+    btnScale = pyqtProperty(float, get_scale, set_scale)
+
+    def enterEvent(self, event):
+        self._animate_scale(1.045, 140, QEasingCurve.OutBack)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._animate_scale(1.0, 160, QEasingCurve.OutQuad)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        self._animate_scale(0.88, 90, QEasingCurve.OutQuad)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        target = 1.045 if self.underMouse() else 1.0
+        self._animate_scale(target, 420, QEasingCurve.OutElastic)
+        super().mouseReleaseEvent(event)
+
+    def _animate_scale(self, target, duration, curve):
+        self._scale_anim.stop()
+        self._scale_anim.setDuration(duration)
+        self._scale_anim.setEasingCurve(curve)
+        self._scale_anim.setStartValue(self._scale)
+        self._scale_anim.setEndValue(target)
+        self._scale_anim.start()
+
+    def paintEvent(self, event):
+        if abs(self._scale - 1.0) < 0.001:
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.translate(self.width() / 2.0, self.height() / 2.0)
+        painter.scale(self._scale, self._scale)
+        painter.translate(-self.width() / 2.0, -self.height() / 2.0)
+        opt = QStyleOptionButton()
+        self.initStyleOption(opt)
+        self.style().drawControl(QStyle.CE_PushButton, opt, painter, self)
+
+
+# =====================================================================
+#  BACKEND — identical behavior to the original script.
+# =====================================================================
 class CredentialManager:
     @staticmethod
     def fetch_vpnbook_password():
@@ -41,61 +1198,57 @@ class CredentialManager:
             pass
         return "3ssumf2"
 
+
 class VPNWorker(QThread):
     status_signal = pyqtSignal(str, bool)
     log_signal = pyqtSignal(str)
-    
+
     def __init__(self):
         super().__init__()
         self.process = None
         self.running = False
-        
+
     def start_vpn(self, config_path, username, password):
         self.config_path = config_path
         self.username = username
         self.password = password
         self.start()
-        
+
     def run(self):
         auth = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
         auth.write(f"{self.username}\n{self.password}\n")
         auth.close()
         os.chmod(auth.name, 0o600)
-        
+
         log_path = '/tmp/openvpn_gui_active.log'
         if os.path.exists(log_path):
             os.remove(log_path)
-            
+
         cmd = [
-            'openvpn',
-            '--config', self.config_path,
-            '--auth-user-pass', auth.name,
-            '--log', log_path,
-            '--redirect-gateway', 'def1'
+            'openvpn', '--config', self.config_path, '--auth-user-pass', auth.name,
+            '--log', log_path, '--redirect-gateway', 'def1'
         ]
-        
+
         self.status_signal.emit("Cleaning existing OpenVPN instances...", False)
-        subprocess.run(['killall', 'openvpn'], stderr=subprocess.DEVNULL)
+        kill_openvpn()
         time.sleep(1)
-        
+
         self.status_signal.emit("Launching OpenVPN connection daemon...", False)
         self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
+
         self.running = True
         start_time = time.time()
         last_read_pos = 0
-        
+
         while self.running and (time.time() - start_time) < 45:
             if self.process.poll() is not None:
                 break
-                
             if os.path.exists(log_path):
                 try:
                     with open(log_path, 'r') as f:
                         f.seek(last_read_pos)
                         new_lines = f.readlines()
                         last_read_pos = f.tell()
-                        
                         for line in new_lines:
                             line_str = line.strip()
                             if line_str:
@@ -109,7 +1262,7 @@ class VPNWorker(QThread):
                 except Exception:
                     pass
             time.sleep(1)
-            
+
         self.status_signal.emit("Connection attempt timed out.", False)
         self.stop()
 
@@ -122,154 +1275,323 @@ class VPNWorker(QThread):
             except Exception:
                 pass
             self.process = None
-        subprocess.run(['killall', 'openvpn'], stderr=subprocess.DEVNULL)
+        kill_openvpn()
 
+
+# =====================================================================
+#  GUI
+# =====================================================================
 class OpenVPNGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.worker = VPNWorker()
         self.configs = []
+        self.current_theme = DEFAULT_THEME
+        self.is_live_theme = False
+        self._is_fullscreen = False
+        self.sound = SoundEngine()
         self.init_ui()
+        self.apply_static_theme(self.current_theme, animate=False)
         self.sync_and_load_files()
-        
+
     def init_ui(self):
         self.setWindowTitle("StrataVane VPN")
-        self.resize(900, 680)
-        
-        self.setStyleSheet("""
-            QMainWindow { background-color: #0d1117; }
-            QLabel { color: #c9d1d9; font-family: sans-serif; font-size: 13px; }
-            QLabel#appHeader {
-                color: #58a6ff;
-                font-family: sans-serif;
-                font-size: 22px;
-                font-weight: bold;
-                padding-bottom: 2px;
-            }
-            QGroupBox {
-                color: #58a6ff;
-                font-weight: bold;
-                border: 1px solid #30363d;
-                border-radius: 8px;
-                margin-top: 10px;
-                padding-top: 15px;
-            }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
-            QListWidget {
-                background-color: #161b22;
-                color: #f0f6fc;
-                border: 1px solid #30363d;
-                border-radius: 6px;
-                font-family: monospace;
-                font-size: 12px;
-            }
-            QListWidget::item { padding: 8px; border-bottom: 1px solid #21262d; }
-            QListWidget::item:selected { background-color: #1f6beb; color: #ffffff; }
-            QLineEdit {
-                background-color: #161b22;
-                color: #f0f6fc;
-                border: 1px solid #30363d;
-                border-radius: 6px;
-                padding: 6px;
-            }
-            QPushButton {
-                background-color: #238636;
-                color: #ffffff;
-                border: none;
-                border-radius: 6px;
-                padding: 10px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background-color: #2ea043; }
-            QPushButton#btnDisconnect { background-color: #da3633; }
-            QPushButton#btnDisconnect:hover { background-color: #f85149; }
-            QPushButton#btnSecondary { background-color: #21262d; border: 1px solid #30363d; }
-            QPushButton#btnSecondary:hover { background-color: #30363d; }
-            QTextEdit {
-                background-color: #010409;
-                color: #3fb950;
-                border: 1px solid #30363d;
-                border-radius: 6px;
-                font-family: monospace;
-                font-size: 11px;
-            }
-        """)
-        
+        self.resize(980, 760)
+
+        # Background canvas fills the whole window; content sits on top of it.
+        self.background = AnimatedBackground()
+        bg_layout = QVBoxLayout(self.background)
+        bg_layout.setContentsMargins(0, 0, 0, 0)
+
+        content = QWidget()
+        content.setObjectName("contentContainer")
+        self.opacity_effect = QGraphicsOpacityEffect(content)
+        self.opacity_effect.setOpacity(1.0)
+        content.setGraphicsEffect(self.opacity_effect)
+        bg_layout.addWidget(content)
+
         main_layout = QVBoxLayout()
-        main_layout.setSpacing(12)
-        main_layout.setContentsMargins(15, 15, 15, 15)
-        
-        # Header Banner
-        lbl_header = QLabel("StrataVane VPN")
+        main_layout.setSpacing(14)
+        main_layout.setContentsMargins(18, 16, 18, 16)
+
+        # Header row
+        header_row = QHBoxLayout()
+        title_col = QVBoxLayout()
+        title_col.setSpacing(0)
+        lbl_header = QLabel("STRATAVANE VPN")
         lbl_header.setObjectName("appHeader")
-        main_layout.addWidget(lbl_header)
-        
-        # Upper Section: Config Selection
+        lbl_sub = QLabel("secure tunnel client")
+        lbl_sub.setObjectName("subHeader")
+        title_col.addWidget(lbl_header)
+        title_col.addWidget(lbl_sub)
+        header_row.addLayout(title_col)
+        header_row.addStretch()
+
+        self.status_dot = PulseDot()
+        header_row.addWidget(self.status_dot)
+
+        # Static theme picker
+        self.theme_box = QComboBox()
+        self.theme_box.setEditable(True)
+        self.theme_box.addItems(THEME_NAMES)
+        self.theme_box.setCurrentText(self.current_theme)
+        self.theme_box.setMinimumWidth(190)
+        self.theme_box.setToolTip("Static themes — flat, no animation")
+        comp1 = QCompleter(THEME_NAMES, self.theme_box)
+        comp1.setCaseSensitivity(Qt.CaseInsensitive)
+        comp1.setFilterMode(Qt.MatchContains)
+        self.theme_box.setCompleter(comp1)
+        self.theme_box.activated.connect(lambda _: self.apply_static_theme(self.theme_box.currentText()))
+        header_row.addWidget(self.theme_box)
+
+        # Live (animated) theme picker
+        self.live_theme_box = QComboBox()
+        self.live_theme_box.setEditable(True)
+        self.live_theme_box.addItem("— off —")
+        self.live_theme_box.addItems(LIVE_THEME_NAMES)
+        self.live_theme_box.setMinimumWidth(190)
+        self.live_theme_box.setToolTip("Live themes — same colors, animated background (ocean, glitch, matrix...)")
+        comp2 = QCompleter(["— off —"] + LIVE_THEME_NAMES, self.live_theme_box)
+        comp2.setCaseSensitivity(Qt.CaseInsensitive)
+        comp2.setFilterMode(Qt.MatchContains)
+        self.live_theme_box.setCompleter(comp2)
+        self.live_theme_box.activated.connect(lambda _: self.on_live_theme_changed(self.live_theme_box.currentText()))
+        header_row.addWidget(self.live_theme_box)
+
+        # Exaggerated (tier 3) theme picker
+        self.exag_theme_box = QComboBox()
+        self.exag_theme_box.setEditable(True)
+        self.exag_theme_box.addItem("— off —")
+        self.exag_theme_box.addItems(EXAGGERATED_THEME_NAMES)
+        self.exag_theme_box.setMinimumWidth(220)
+        self.exag_theme_box.setToolTip("EXAGGERATED themes — full dramatic set-piece animations")
+        comp3 = QCompleter(["— off —"] + EXAGGERATED_THEME_NAMES, self.exag_theme_box)
+        comp3.setCaseSensitivity(Qt.CaseInsensitive)
+        comp3.setFilterMode(Qt.MatchContains)
+        self.exag_theme_box.setCompleter(comp3)
+        self.exag_theme_box.activated.connect(lambda _: self.on_exaggerated_theme_changed(self.exag_theme_box.currentText()))
+        header_row.addWidget(self.exag_theme_box)
+
+        self.btn_mute = LivelyButton("🔊" if self.sound.available else "🔇")
+        self.btn_mute.setObjectName("btnSecondary")
+        self.btn_mute.setFixedWidth(44)
+        if self.sound.available:
+            self.btn_mute.setToolTip("Mute themed ambient sound")
+        else:
+            self.btn_mute.setToolTip("Qt Multimedia not installed — themed sound unavailable "
+                                      "(see INSTALL.md for the extra package)")
+            self.btn_mute.setEnabled(False)
+        self.btn_mute.clicked.connect(self.toggle_mute)
+        header_row.addWidget(self.btn_mute)
+
+        self.btn_fullscreen = LivelyButton("⛶")
+        self.btn_fullscreen.setObjectName("btnSecondary")
+        self.btn_fullscreen.setFixedWidth(44)
+        self.btn_fullscreen.setToolTip("Toggle fullscreen (F11)")
+        self.btn_fullscreen.clicked.connect(self.toggle_fullscreen)
+        header_row.addWidget(self.btn_fullscreen)
+
+        main_layout.addLayout(header_row)
+
+        self.glow_bar = GlowBar()
+        main_layout.addWidget(self.glow_bar)
+
+        # Config selection
         file_box = QGroupBox("1. Select OpenVPN Profile (.ovpn)")
         file_layout = QVBoxLayout()
-        
         self.file_list = QListWidget()
         file_layout.addWidget(self.file_list)
-        
+
         file_btn_layout = QHBoxLayout()
-        self.btn_browse = QPushButton("Browse Custom .ovpn File...")
+        self.btn_browse = LivelyButton("Browse Custom .ovpn File...")
         self.btn_browse.setObjectName("btnSecondary")
         self.btn_browse.clicked.connect(self.browse_custom_file)
         file_btn_layout.addWidget(self.btn_browse)
-        
-        self.btn_refresh = QPushButton("Fetch / Sync VPNBook Bundles")
+
+        self.btn_refresh = LivelyButton("Fetch / Sync VPNBook Bundles")
         self.btn_refresh.setObjectName("btnSecondary")
         self.btn_refresh.clicked.connect(self.sync_and_load_files)
         file_btn_layout.addWidget(self.btn_refresh)
-        
+
+        self.btn_visit_site = LivelyButton("Open VPNBook.com ↗")
+        self.btn_visit_site.setObjectName("btnLink")
+        self.btn_visit_site.setToolTip("Opens vpnbook.com in your browser for fresh passwords or manual configs.")
+        self.btn_visit_site.clicked.connect(self.open_vpnbook_site)
+        file_btn_layout.addWidget(self.btn_visit_site)
+
         file_layout.addLayout(file_btn_layout)
         file_box.setLayout(file_layout)
         main_layout.addWidget(file_box)
-        
-        # Middle Section: Credentials & Controls
+
+        # Auth + controls
         auth_box = QGroupBox("2. Authentication & Connection")
         auth_layout = QHBoxLayout()
-        
         auth_layout.addWidget(QLabel("User:"))
         self.txt_user = QLineEdit("vpnbook")
         auth_layout.addWidget(self.txt_user)
-        
         auth_layout.addWidget(QLabel("Pass:"))
         self.txt_pass = QLineEdit()
         auth_layout.addWidget(self.txt_pass)
-        
-        self.btn_connect = QPushButton("CONNECT")
+
+        self.btn_connect = LivelyButton("CONNECT")
         self.btn_connect.clicked.connect(self.handle_connect)
         auth_layout.addWidget(self.btn_connect)
-        
-        self.btn_disconnect = QPushButton("DISCONNECT")
+
+        self.btn_disconnect = LivelyButton("DISCONNECT")
         self.btn_disconnect.setObjectName("btnDisconnect")
         self.btn_disconnect.clicked.connect(self.handle_disconnect)
         auth_layout.addWidget(self.btn_disconnect)
-        
+
         auth_box.setLayout(auth_layout)
         main_layout.addWidget(auth_box)
-        
-        # Lower Section: Live Output Logs
+
+        # Status + logs
         self.lbl_status = QLabel("Status: Idle")
-        self.lbl_status.setStyleSheet("color: #d29922; font-weight: bold; font-size: 14px;")
+        self.lbl_status.setStyleSheet("font-weight: bold; font-size: 14px;")
         main_layout.addWidget(self.lbl_status)
-        
+
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
         main_layout.addWidget(self.log_box)
-        
-        container = QWidget()
-        container.setLayout(main_layout)
-        self.setCentralWidget(container)
-        
+
+        content.setLayout(main_layout)
+        self.setCentralWidget(self.background)
+
         self.worker.status_signal.connect(self.on_status_update)
         self.worker.log_signal.connect(self.append_log)
 
+        QShortcut(QKeySequence("F11"), self, activated=self.toggle_fullscreen)
+        QShortcut(QKeySequence("Escape"), self, activated=self.exit_fullscreen)
+
+        self.set_status_dot("idle")
+
+    # ---- fullscreen ----
+    def toggle_fullscreen(self):
+        if self._is_fullscreen:
+            self.showNormal()
+        else:
+            self.showFullScreen()
+        self._is_fullscreen = not self._is_fullscreen
+
+    def exit_fullscreen(self):
+        if self._is_fullscreen:
+            self.showNormal()
+            self._is_fullscreen = False
+
+    def toggle_mute(self):
+        muted = self.sound.toggle_mute()
+        self.btn_mute.setText("🔇" if muted else "🔊")
+        if not muted and self.is_live_theme:
+            self.sound.play_for_mode(self.background.mode)
+
+    # ---- theming ----
+    def _crossfade(self, apply_fn):
+        fade_out = QPropertyAnimation(self.opacity_effect, b"opacity", self)
+        fade_out.setDuration(150)
+        fade_out.setStartValue(1.0)
+        fade_out.setEndValue(0.2)
+        fade_out.setEasingCurve(QEasingCurve.InOutQuad)
+
+        fade_in = QPropertyAnimation(self.opacity_effect, b"opacity", self)
+        fade_in.setDuration(220)
+        fade_in.setStartValue(0.2)
+        fade_in.setEndValue(1.0)
+        fade_in.setEasingCurve(QEasingCurve.InOutQuad)
+
+        def _mid():
+            apply_fn()
+            fade_in.start()
+
+        fade_out.finished.connect(_mid)
+        self._theme_anim_refs = (fade_out, fade_in)
+        fade_out.start()
+
+    def apply_static_theme(self, name, animate=True):
+        t = THEMES.get(name)
+        if not t:
+            return
+        self.current_theme = name
+        self.is_live_theme = False
+        self.live_theme_box.setCurrentIndex(0)
+        self.exag_theme_box.setCurrentIndex(0)
+
+        def _apply():
+            self.background.set_theme("none", t["accent"], t["accent2"], t["bg"])
+            self.setStyleSheet(build_stylesheet(t, translucent=False))
+            self.glow_bar.set_colors(t["accent"], t["accent2"])
+            for btn in (self.btn_connect, self.btn_browse, self.btn_refresh,
+                        self.btn_disconnect, self.btn_visit_site, self.btn_fullscreen):
+                btn.set_glow_color(t["accent"])
+            self._update_status_dot_color()
+            self.sound.stop()
+
+        if animate:
+            self._crossfade(_apply)
+        else:
+            _apply()
+
+    def on_live_theme_changed(self, name):
+        if name == "— off —" or name not in LIVE_THEMES:
+            return
+        spec = LIVE_THEMES[name]
+        t = THEMES[spec["base"]]
+        self.current_theme = spec["base"]
+        self.is_live_theme = True
+        self.theme_box.setCurrentText(spec["base"])
+        self.exag_theme_box.setCurrentIndex(0)
+
+        def _apply():
+            self.background.set_theme(spec["mode"], t["accent"], t["accent2"], t["bg"])
+            self.setStyleSheet(build_stylesheet(t, translucent=True))
+            self.glow_bar.set_colors(t["accent"], t["accent2"])
+            for btn in (self.btn_connect, self.btn_browse, self.btn_refresh,
+                        self.btn_disconnect, self.btn_visit_site, self.btn_fullscreen):
+                btn.set_glow_color(t["accent"])
+            self._update_status_dot_color()
+            self.sound.play_for_mode(spec["mode"])
+
+        self._crossfade(_apply)
+
+    def on_exaggerated_theme_changed(self, name):
+        if name == "— off —" or name not in EXAGGERATED_THEMES:
+            return
+        spec = EXAGGERATED_THEMES[name]
+        t = THEMES[spec["base"]]
+        self.current_theme = spec["base"]
+        self.is_live_theme = True
+        self.theme_box.setCurrentText(spec["base"])
+        self.live_theme_box.setCurrentIndex(0)
+
+        def _apply():
+            self.background.set_theme(spec["mode"], t["accent"], t["accent2"], t["bg"])
+            self.setStyleSheet(build_stylesheet(t, translucent=True))
+            self.glow_bar.set_colors(t["accent"], t["accent2"])
+            for btn in (self.btn_connect, self.btn_browse, self.btn_refresh,
+                        self.btn_disconnect, self.btn_visit_site, self.btn_fullscreen):
+                btn.set_glow_color(t["accent"])
+            self._update_status_dot_color()
+            self.sound.play_for_mode(spec["mode"])
+
+        self._crossfade(_apply)
+
+    def _update_status_dot_color(self):
+        t = THEMES[self.current_theme]
+        state = getattr(self, "_dot_state", "idle")
+        colors = {"idle": t["subtext"], "connecting": t["warning"],
+                  "connected": t["success"], "error": t["danger"]}
+        self.status_dot.set_color(colors.get(state, t["subtext"]), pulsing=True)
+
+    def set_status_dot(self, state):
+        self._dot_state = state
+        self._update_status_dot_color()
+
+    def open_vpnbook_site(self):
+        QDesktopServices.openUrl(QUrl(VPNBOOK_URL))
+
+    # ---- identical behavior to the original ----
     def sync_and_load_files(self):
         os.makedirs(CONFIG_DIR, exist_ok=True)
         self.append_log("Syncing config files from VPNBook...")
-        
         try:
             res = requests.get(f"{VPNBOOK_URL}/freevpn/openvpn", timeout=8)
             soup = BeautifulSoup(res.text, 'html.parser')
@@ -285,27 +1607,22 @@ class OpenVPNGUI(QMainWindow):
                     os.remove(zpath)
         except Exception as e:
             self.append_log(f"Sync note: {e}")
-            
-        # Fetch dynamic password
+
         pwd = CredentialManager.fetch_vpnbook_password()
         self.txt_pass.setText(pwd)
-        
         self.reload_file_list()
 
     def reload_file_list(self):
         self.configs.clear()
         self.file_list.clear()
-        
         for root, _, files in os.walk(CONFIG_DIR):
             for f in files:
                 if f.endswith('.ovpn'):
                     full_path = os.path.join(root, f)
                     self.configs.append({'name': f, 'path': full_path})
-                    
         self.configs = sorted(self.configs, key=lambda x: x['name'])
         for item in self.configs:
             self.file_list.addItem(item['name'])
-            
         self.append_log(f"Loaded {len(self.configs)} configuration file(s).")
 
     def browse_custom_file(self):
@@ -321,33 +1638,39 @@ class OpenVPNGUI(QMainWindow):
         if not item:
             self.append_log("Error: Select a profile from the list first.")
             return
-            
+
         selected_text = item.text()
         target_path = None
         for c in self.configs:
             if c['name'] in selected_text:
                 target_path = c['path']
                 break
-                
+
         if not target_path or not os.path.exists(target_path):
             self.append_log("Error: Config file path does not exist.")
             return
-            
+
         user = self.txt_user.text().strip()
         password = self.txt_pass.text().strip()
-        
+
         self.btn_connect.setEnabled(False)
+        self.set_status_dot("connecting")
         self.worker.start_vpn(target_path, user, password)
 
     def handle_disconnect(self):
         self.worker.stop()
         self.btn_connect.setEnabled(True)
+        self.set_status_dot("idle")
         self.lbl_status.setText("Status: Disconnected")
         self.append_log("OpenVPN tunnel stopped.")
 
     def on_status_update(self, msg, success):
         self.lbl_status.setText(f"Status: {msg}")
         self.append_log(f"[*] {msg}")
+        if success:
+            self.set_status_dot("connected")
+        elif "timed out" in msg or "failed" in msg.lower():
+            self.set_status_dot("error")
         if success or "timed out" in msg or "failed" in msg.lower():
             self.btn_connect.setEnabled(True)
 
@@ -355,16 +1678,25 @@ class OpenVPNGUI(QMainWindow):
         timestamp = datetime.now().strftime('%H:%M:%S')
         self.log_box.append(f"[{timestamp}] {text}")
 
+    def closeEvent(self, event):
+        self.sound.stop()
+        super().closeEvent(event)
+
+
 def main():
-    if os.geteuid() != 0:
-        print("[!] OpenVPN requires root permissions for interface/routing changes.")
-        print("[!] Run with: sudo python3 openvpn_gui.py")
+    if not is_admin():
+        print("[!] OpenVPN requires admin/root permissions for interface/routing changes.")
+        if platform.system() == "Windows":
+            print("[!] Right-click and 'Run as Administrator', or run from an elevated terminal.")
+        else:
+            print("[!] Run with: sudo python3 stratavaneVPN.py")
         sys.exit(1)
-        
+
     app = QApplication(sys.argv)
     window = OpenVPNGUI()
     window.show()
     sys.exit(app.exec_())
+
 
 if __name__ == '__main__':
     main()
