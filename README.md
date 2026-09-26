@@ -2,6 +2,8 @@ Installing StrataVane VPN
 
 StrataVane requires admin/root privileges to run (OpenVPN needs to modify network interfaces and routing tables). Pick your OS below.
 
+Themed sound (optional): the 🔊 button plays a fully synthesized ambient loop matching each Live/Exaggerated theme's animation engine — generated from scratch with math, not licensed samples. It needs Qt's Multimedia module, which is usually a separate package from the main PyQt5 install. If it's missing, the app still runs fine — the mute button just greys out.
+
 Arch-based (CachyOS, Arch, Manjaro, EndeavourOS)
 bash
 sudo pacman -Syu
@@ -9,13 +11,19 @@ sudo pacman -S python python-pip python-pyqt5 python-requests python-beautifulso
 git clone https://github.com/YOUR_USERNAME/YOUR_REPO.git
 cd YOUR_REPO
 sudo python3 stratavaneVPN.py
+
+(python-pyqt5 on Arch includes Multimedia, so sound should work out of the box.)
+
 Debian-based (Ubuntu, Debian, Linux Mint, Pop!_OS)
 bash
 sudo apt update
-sudo apt install python3 python3-pip python3-pyqt5 python3-requests python3-bs4 openvpn
+sudo apt install python3 python3-pip python3-pyqt5 python3-pyqt5.qtmultimedia python3-requests python3-bs4 openvpn
 git clone https://github.com/YOUR_USERNAME/YOUR_REPO.git
 cd YOUR_REPO
 sudo python3 stratavaneVPN.py
+
+(python3-pyqt5.qtmultimedia is the separate package needed for themed sound — without it the app runs fine, just silently.)
+
 BSD-based (FreeBSD)
 
 Package names can shift slightly between FreeBSD releases — if a name below doesn't resolve, run pkg search pyqt5 / pkg search beautifulsoup to find the current one for your version.
@@ -87,20 +95,5 @@ ping -c 4 8.8.8.8        # basic connectivity sanity check
   pre-baked, so you're always getting current servers/passwords.
 - Requires admin/root because OpenVPN needs to create a `tun`/`utun`/TAP
   interface and rewrite your default route — there's no way around this on
-  any OS..# Installation
-
-StrataVane requires root privileges to configure network interfaces and routing tables[cite: 1].
-
-## Arch-based (CachyOS, Arch, Manjaro, EndeavourOS)
-
-```bash
-sudo pacman -Syu
-sudo pacman -S python python-pip python-pyqt5 python-requests python-beautifulsoup4 openvpn git
-git clone [https://github.com/YOUR_USERNAME/YOUR_REPO.git](https://github.com/YOUR_USERNAME/YOUR_REPO.git)
-cd YOUR_REPO
-sudo python3 stratavaneVPN.py.sudo apt update
-sudo apt install -y python3 python3-pip python3-pyqt5 python3-requests python3-bs4 openvpn git
-git clone [https://github.com/YOUR_USERNAME/YOUR_REPO.git](https://github.com/YOUR_USERNAME/YOUR_REPO.git)
-cd YOUR_REPO
-sudo python3 stratavaneVPN.py. for debian and arch users
+  any OS.
 
