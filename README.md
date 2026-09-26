@@ -87,4 +87,20 @@ ping -c 4 8.8.8.8        # basic connectivity sanity check
   pre-baked, so you're always getting current servers/passwords.
 - Requires admin/root because OpenVPN needs to create a `tun`/`utun`/TAP
   interface and rewrite your default route — there's no way around this on
-  any OS.
+  any OS..# Installation
+
+StrataVane requires root privileges to configure network interfaces and routing tables[cite: 1].
+
+## Arch-based (CachyOS, Arch, Manjaro, EndeavourOS)
+
+```bash
+sudo pacman -Syu
+sudo pacman -S python python-pip python-pyqt5 python-requests python-beautifulsoup4 openvpn git
+git clone [https://github.com/YOUR_USERNAME/YOUR_REPO.git](https://github.com/YOUR_USERNAME/YOUR_REPO.git)
+cd YOUR_REPO
+sudo python3 stratavaneVPN.py.sudo apt update
+sudo apt install -y python3 python3-pip python3-pyqt5 python3-requests python3-bs4 openvpn git
+git clone [https://github.com/YOUR_USERNAME/YOUR_REPO.git](https://github.com/YOUR_USERNAME/YOUR_REPO.git)
+cd YOUR_REPO
+sudo python3 stratavaneVPN.py. for debian and arch users
+
